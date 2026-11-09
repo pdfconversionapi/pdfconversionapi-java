@@ -1,0 +1,92 @@
+# Publishes to Maven Central when a version tag (v0.1.0) is pushed. Written, never run so far.
+#
+# 1. test: checks the tag against pom.xml, builds and runs the unit and conformance tests (with
+#    the suite bundled in conformance/), then the live tests against the production API when the
+#    PDFCONVERSIONAPI_KEY secret is set.
+# 2. publish: runs in the "maven-central" environment (it waits for a reviewer's approval when the
+#    environment requires one), builds, signs and uploads the bundle.
+#
+# Before the first release:
+# - verify the com.pdfconversionapi namespace on https://central.sonatype.com;
+# - add these repository secrets (referenced by name only):
+#     CENTRAL_TOKEN_USERNAME, CENTRAL_TOKEN_PASSWORD  a Central Portal user token
+#     MAVEN_GPG_PRIVATE_KEY                           an ASCII-armored private key, its public key on a key server
+#     MAVEN_GPG_PASSPHRASE                            that key's passphrase
+# The bundle is uploaded and validated; publish it from the Central Portal (autoPublish is false).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  PDFCONVERSIONAPI_CONFORMANCE_DIR: ${{ github.workspace }}/conformance
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-node@v4 # runs conformance/mock-server.mjs
+        with:
+          node-version: "22"
+      - name: Check that the tag matches the version in pom.xml
+        run: |
+          version=$(mvn -B -ntp -q help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match version $version" >&2
+            exit 1
+          fi
+      - name: Check that the conformance suite is in the repository
+        run: |
+          test -f conformance/cases.json && test -f conformance/mock-server.mjs || {
+            echo "::error::conformance/ is missing: this repository keeps a copy of the shared test suite (https://github.com/pdfconversionapi/sdk-conformance) there"
+            exit 1
+          }
+      - name: Build, unit and conformance tests
+        run: mvn -B -ntp verify -Dpdfconversionapi.skipLive=true
+      - name: Live tests against the production API
+        env:
+          PDFCONVERSIONAPI_KEY: ${{ secrets.PDFCONVERSIONAPI_KEY }}
+          PDFCONVERSIONAPI_LIVE_BASE_URL: https://api.pdfconversionapi.com
+        run: |
+          if [ -z "$PDFCONVERSIONAPI_KEY" ]; then
+            echo "::warning::The PDFCONVERSIONAPI_KEY secret is not set: live tests skipped."
+            exit 0
+          fi
+          mvn -B -ntp test -Dtest=LiveTest
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          server-id: central
+          server-username: CENTRAL_TOKEN_USERNAME
+          server-password: CENTRAL_TOKEN_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - uses: actions/setup-node@v4 # the unit and conformance tests run again before the upload
+        with:
+          node-version: "22"
+      - name: Build, sign and upload
+        run: mvn -B -ntp -Prelease deploy -Dpdfconversionapi.skipLive=true
+        env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
